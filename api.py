@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 import requests
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
 app = FastAPI()
@@ -9,10 +10,8 @@ app = FastAPI()
 TELEGRAM_TOKEN = "8579544778:AAFkT6sJdc6F62dW_qt573KCoMR_joq5wfQ"
 TELEGRAM_ID = "945189454"
 
-# Strateji Ayarları
-H4_EMA_PERIYODU = 200
-LIKIDITE_GERIYE_BAKIS = 15
-RR_ORANI = 2.0  # Risk Reward (1'e 2 Kazanç)
+# Takip Edilecek Coinler Listesi
+COIN_LISTESI = ["BTCUSDT", "ETHUSDT"]
 
 def telegrama_gonder(mesaj):
     try:
@@ -21,135 +20,128 @@ def telegrama_gonder(mesaj):
         requests.post(url, json=data, timeout=5)
     except: pass
 
-def veri_getir_binance(symbol="BTCUSDT", interval="15m", limit=50):
+# --- İNDİKATÖR HESAPLAMALARI ---
+def calculate_wma(series, period):
+    """Ağırlıklı Hareketli Ortalama (WMA)"""
+    return series.rolling(period).apply(lambda x: np.dot(x, np.arange(1, period + 1)) / np.arange(1, period + 1).sum(), raw=True)
+
+def veri_getir(symbol):
+    """Belirtilen sembol için Binance verisi çeker"""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        # verify=False, SSL sorunlarına karşı garanti olsun diye eklenebilir
-        resp = requests.get(url, params=params, timeout=10)
+        params = {"symbol": symbol, "interval": "15m", "limit": 100}
+        r = requests.get(url, params=params, timeout=5)
         
-        if resp.status_code == 200:
-            data = resp.json()
-            df = pd.DataFrame(data, columns=['zaman', 'acilis', 'yuksek', 'dusuk', 'kapanis', 'hacim', 'x', 'y', 'z', 't', 'w', 'q'])
-            df = df.astype({'acilis': 'float', 'yuksek': 'float', 'dusuk': 'float', 'kapanis': 'float'})
+        if r.status_code == 200:
+            df = pd.DataFrame(r.json(), columns=['time','open','high','low','close','vol','x','y','z','t','w','q'])
+            df = df.astype({'open':'float','high':'float','low':'float','close':'float'})
+            
+            # İndikatörler
+            df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+            df['wma30'] = calculate_wma(df['close'], 30)
+            
+            # Swing Noktaları (MSB için)
+            df['swing_high'] = df['high'].rolling(window=11, center=True).max()
+            df['swing_low'] = df['low'].rolling(window=11, center=True).min()
+            
             return df
     except Exception as e:
-        print(f"Veri Hatası ({interval}): {e}")
+        print(f"{symbol} Veri Hatası: {e}")
     return None
 
-def veri_getir_coingecko():
-    """Yedek veri kaynağı (Sadece M15 verisi verir, trend analizi yapamaz)"""
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=1"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # CoinGecko formatı: [Zaman, Açılış, Yüksek, Düşük, Kapanış]
-            df = pd.DataFrame(data, columns=['zaman', 'acilis', 'yuksek', 'dusuk', 'kapanis'])
-            return df
-    except:
-        return None
-
-def smc_analizi_yap():
-    # 1. ADIM: H4 Trend Analizi (Binance'den)
-    df_h4 = veri_getir_binance(interval="4h", limit=250)
+def tekil_analiz(symbol):
+    """Tek bir coin için stratejiyi uygular"""
+    df = veri_getir(symbol)
+    if df is None:
+        return {"sembol": symbol, "durum": "Veri Alınamadı", "sinyal": "YOK"}
     
-    trend = "BULLISH" # Varsayılan (Veri çekemezsek Long odaklı kalsın)
+    # Kapanmış mum (Analiz için)
+    curr = df.iloc[-2]
+    # Canlı mum (Fiyat gösterimi için)
+    live = df.iloc[-1]
     
-    if df_h4 is not None:
-        # PANDAS_TA YERİNE MANUEL HESAPLAMA (EMA 200)
-        # Formül: Fiyatın ağırlıklı ortalaması
-        df_h4['ema200'] = df_h4['kapanis'].ewm(span=H4_EMA_PERIYODU, adjust=False).mean()
-        
-        anlik_h4_ema = df_h4['ema200'].iloc[-1]
-        anlik_fiyat_h4 = df_h4['kapanis'].iloc[-1]
-        
-        trend = "BULLISH" if anlik_fiyat_h4 > anlik_h4_ema else "BEARISH"
-    
-    # 2. ADIM: M15 İşlem Analizi
-    df_m15 = veri_getir_binance(interval="15m", limit=50)
-    
-    # Eğer Binance M15 vermezse CoinGecko dene
-    if df_m15 is None:
-        df_m15 = veri_getir_coingecko()
-        
-    if df_m15 is None: return None
-    
-    # Analiz
-    mum = df_m15.iloc[-2]  
-    # Son 15 mumun (mevcut hariç) en düşüğü ve yükseği
-    onceki_mumlar = df_m15.iloc[-2-LIKIDITE_GERIYE_BAKIS : -2] 
-    
-    acilis = mum['acilis']
-    kapanis = mum['kapanis']
-    yuksek = mum['yuksek']
-    dusuk = mum['dusuk']
-    
-    govde = abs(acilis - kapanis)
-    ust_fitil = yuksek - max(acilis, kapanis)
-    alt_fitil = min(acilis, kapanis) - dusuk
+    last_swing_high = df['swing_high'].dropna().iloc[-1]
+    last_swing_low = df['swing_low'].dropna().iloc[-1]
     
     sinyal = "NÖTR"
-    tp = 0.0
-    sl = 0.0
+    detay = "Beklemede"
     
-    # --- LONG STRATEJİSİ ---
-    if trend == "BULLISH":
-        swing_low = onceki_mumlar['dusuk'].min()
-        
-        # 1. Sweep: Fitil Swing Low'un altına indi mi?
-        is_sweep = (dusuk < swing_low) and (kapanis > swing_low)
-        # 2. Pinbar: Alt fitil gövdeden büyük mü?
-        is_pinbar = (alt_fitil > govde * 1.5) and (ust_fitil < govde)
-        
-        if is_sweep and is_pinbar:
-            sinyal = "LONG (SMC) 🟢"
-            sl = dusuk - (kapanis * 0.0005) # Fitilin biraz altı
-            risk = kapanis - sl
-            tp = kapanis + (risk * RR_ORANI) # 1:2 Oranı
+    # Tolerans: %0.1 (Fiyat çizgiye çok yaklaşsa bile kabul et)
+    tolerans = curr['close'] * 0.001 
+    
+    tp, sl = 0, 0
+    
+    # --- STRATEJİ: 9 EMA + 30 WMA + PULLBACK ---
+    
+    # 1. LONG SENARYOSU
+    if curr['ema9'] > curr['wma30']: # Trend Yukarı
+        if curr['close'] > last_swing_high: # MSB Onaylı
+            # Pullback Kontrolü
+            dist = abs(curr['low'] - curr['ema9'])
+            if curr['low'] <= curr['ema9'] or dist <= tolerans:
+                sinyal = "LONG (Pullback) 🟢"
+                detay = "Trend Yukarı + Pullback"
+                
+                sl = curr['wma30'] * 0.998
+                risk = curr['close'] - sl
+                tp = curr['close'] + (risk * 2)
+                
+                # Bildirim Gönder
+                mesaj = (f"🚀 {symbol} İÇİN LONG FIRSATI!\n\n"
+                         f"Fiyat: {live['close']}\n"
+                         f"Stop (SL): {round(sl, 2)}\n"
+                         f"Hedef (TP): {round(tp, 2)}")
+                telegrama_gonder(mesaj)
 
-    # --- SHORT STRATEJİSİ ---
-    elif trend == "BEARISH":
-        swing_high = onceki_mumlar['yuksek'].max()
-        
-        # 1. Sweep: Fitil Swing High'ın üstüne çıktı mı?
-        is_sweep = (yuksek > swing_high) and (kapanis < swing_high)
-        # 2. Pinbar: Üst fitil gövdeden büyük mü?
-        is_pinbar = (ust_fitil > govde * 1.5) and (alt_fitil < govde)
-        
-        if is_sweep and is_pinbar:
-            sinyal = "SHORT (SMC) 🔴"
-            sl = yuksek + (kapanis * 0.0005) # Fitilin biraz üstü
-            risk = sl - kapanis
-            tp = kapanis - (risk * RR_ORANI) # 1:2 Oranı
-            
+    # 2. SHORT SENARYOSU
+    elif curr['ema9'] < curr['wma30']: # Trend Aşağı
+        if curr['close'] < last_swing_low: # MSB Onaylı
+            # Pullback Kontrolü
+            dist = abs(curr['high'] - curr['ema9'])
+            if curr['high'] >= curr['ema9'] or dist <= tolerans:
+                sinyal = "SHORT (Pullback) 🔴"
+                detay = "Trend Aşağı + Pullback"
+                
+                sl = curr['wma30'] * 1.002
+                risk = sl - curr['close']
+                tp = curr['close'] - (risk * 2)
+                
+                # Bildirim Gönder
+                mesaj = (f"🔻 {symbol} İÇİN SHORT FIRSATI!\n\n"
+                         f"Fiyat: {live['close']}\n"
+                         f"Stop (SL): {round(sl, 2)}\n"
+                         f"Hedef (TP): {round(tp, 2)}")
+                telegrama_gonder(mesaj)
+
     return {
-        "sinyal": sinyal, "fiyat": kapanis,
-        "tp": round(tp, 2), "sl": round(sl, 2), "trend": trend
+        "sembol": symbol,
+        "fiyat": live['close'],
+        "sinyal": sinyal,
+        "ema9": round(curr['ema9'], 2),
+        "wma30": round(curr['wma30'], 2),
+        "durum": detay,
+        "tp": round(tp, 2),
+        "sl": round(sl, 2)
     }
 
+# --- ENDPOINT ---
 @app.get("/analiz-yap")
-def analiz_et():
-    print("SMC Analizi (Manuel EMA) çalışıyor...")
-    try:
-        sonuc = smc_analizi_yap()
-        if sonuc:
-            if "LONG" in sonuc['sinyal'] or "SHORT" in sonuc['sinyal']:
-                mesaj = (f"💎 SMC SETUP!\n"
-                         f"Trend: {sonuc['trend']}\n"
-                         f"Sinyal: {sonuc['sinyal']}\n"
-                         f"Giriş: {sonuc['fiyat']}\n"
-                         f"SL: {sonuc['sl']} | TP: {sonuc['tp']}")
-                telegrama_gonder(mesaj)
-            
-            return {
-                "zaman": datetime.now().strftime("%H:%M"),
-                "fiyat": sonuc['fiyat'],
-                "sinyal": sonuc['sinyal'],
-                "tp": sonuc['tp'],
-                "sl": sonuc['sl']
-            }
-    except Exception as e:
-        print(f"Hata: {e}")
-        
-    return {"zaman": "Hata", "fiyat": 0, "sinyal": "Veri Yok", "tp": 0, "sl": 0}
+def tumunu_analiz_et():
+    sonuclar = []
+    print(f"Analiz Başladı: {datetime.now()}")
+    
+    # Listedeki her coin için döngü
+    for coin in COIN_LISTESI:
+        sonuc = tekil_analiz(coin)
+        sonuclar.append(sonuc)
+    
+    return {
+        "zaman": datetime.now().strftime("%H:%M:%S"),
+        "analizler": sonuclar
+    }
+
+# Bağlantı Testi
+@app.get("/test")
+def test_et():
+    res = telegrama_gonder("🔔 Bot Çoklu Coin Modunda Çalışıyor!")
+    return {"durum": "OK", "telegram": res}
