@@ -97,7 +97,7 @@ def cron_endpoint():
 
 @app.get("/")
 def home(): return {"mesaj": "Bot aktif."}
-    
+
     @app.get("/test")
 def manuel_test():
     mesaj = "🔔 TEST: Botun Telegram bağlantısı sağlam!"
