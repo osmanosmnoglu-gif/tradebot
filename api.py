@@ -1,5 +1,4 @@
 from fastapi import FastAPI
-from fastapi import FastAPI
 import requests
 import pandas as pd
 import numpy as np
@@ -7,7 +6,7 @@ from datetime import datetime
 
 app = FastAPI()
 
-# --- TELEGRAM AYARLARI ---
+# --- AYARLAR (BİLGİLERİNİZİ GİRİN) ---
 TELEGRAM_TOKEN = "8579544778:AAFkT6sJdc6F62dW_qt573KCoMR_joq5wfQ"
 TELEGRAM_ID = "945189454"
 COIN_LISTESI = ["BTCUSDT", "ETHUSDT"]
@@ -19,7 +18,7 @@ def telegrama_gonder(mesaj):
         requests.post(url, json=data, timeout=5)
     except: pass
 
-# --- MOTOR ---
+# --- İNDİKATÖR FONKSİYONLARI ---
 def calculate_wma(series, period):
     return series.rolling(period).apply(lambda x: np.dot(x, np.arange(1, period + 1)) / np.arange(1, period + 1).sum(), raw=True)
 
@@ -38,6 +37,7 @@ def veri_getir(symbol):
             return df
     except: return None
 
+# --- ANALİZ MOTORU ---
 def tekil_analiz(symbol):
     df = veri_getir(symbol)
     if df is None: return {"sembol": symbol, "sinyal": "Veri Yok", "fiyat": 0}
@@ -77,29 +77,32 @@ def tekil_analiz(symbol):
         "durum": detay, "tp": round(tp, 2), "sl": round(sl, 2)
     }
 
-# --- YENİ MANTIĞI AYIRIYORUZ ---
 def ana_motor():
     sonuclar = []
     for coin in COIN_LISTESI:
         sonuclar.append(tekil_analiz(coin))
     return sonuclar
 
-# 1. FLUTTER İÇİN (Veri Dolu)
+# --- ENDPOINTLER ---
+
+# 1. Ana Sayfa (Hata vermemesi için)
+@app.get("/")
+def home():
+    return {"mesaj": "Bot aktif. /tetikle veya /analiz-yap kullanın."}
+
+# 2. FLUTTER İÇİN (Veri Dolu)
 @app.get("/analiz-yap")
 def flutter_endpoint():
     return {"zaman": datetime.now().strftime("%H:%M:%S"), "analizler": ana_motor()}
 
-# 2. CRON-JOB İÇİN (Çok Hafif - Sorunu Çözer)
+# 3. CRON-JOB İÇİN (Hafif Mod - Hatayı Çözer)
 @app.get("/tetikle")
 def cron_endpoint():
-    ana_motor() # İşlemi yap ama sonucu döndürme
-    return {"durum": "OK"} # Sadece minik bir cevap dön
+    ana_motor() # İşlemi yap ama büyük veri döndürme
+    return {"durum": "OK"}
 
-@app.get("/")
-def home(): return {"mesaj": "Bot aktif."}
-
-    @app.get("/test")
-def manuel_test():
-    mesaj = "🔔 TEST: Botun Telegram bağlantısı sağlam!"
-    telegrama_gonder(mesaj)
+# 4. TEST İÇİN
+@app.get("/test")
+def test_et():
+    telegrama_gonder("🔔 TEST: Bağlantı Başarılı!")
     return {"durum": "Mesaj gönderildi"}
