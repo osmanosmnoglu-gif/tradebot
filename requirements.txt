@@ -2,3 +2,7 @@ fastapi
 uvicorn
 requests
 pandas
+numpy
+xgboost
+scikit-learn
+ta
