@@ -8,10 +8,10 @@ import os
 
 app = FastAPI()
 
-# --- AYARLAR (BURALARI DOLDURUN) ---
+# --- AYARLAR ---
 TELEGRAM_TOKEN = "8579544778:AAFkT6sJdc6F62dW_qt573KCoMR_joq5wfQ"
 TELEGRAM_ID = "945189454"
-COIN_LISTESI = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+COIN_LISTESI = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 DOSYA_ADI = "aktif_islemler.json"
 
 def telegrama_gonder(mesaj):
@@ -21,15 +21,13 @@ def telegrama_gonder(mesaj):
         requests.post(url, json=data, timeout=5)
     except: pass
 
-# --- HAFIZA YÖNETİMİ (JSON) ---
+# --- HAFIZA YÖNETİMİ ---
 def islemleri_yukle():
-    if not os.path.exists(DOSYA_ADI):
-        return {}
+    if not os.path.exists(DOSYA_ADI): return {}
     try:
         with open(DOSYA_ADI, "r") as f:
             content = f.read()
-            if not content: return {}
-            return json.loads(content)
+            return json.loads(content) if content else {}
     except: return {}
 
 def islem_kaydet(islemler):
@@ -45,7 +43,8 @@ def calculate_wma(series, period):
 def veri_getir(symbol):
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": "15m", "limit": 200}
+        # 300 mum çekiyoruz ki gerideki swingleri net bulabilelim
+        params = {"symbol": symbol, "interval": "15m", "limit": 300}
         r = requests.get(url, params=params, timeout=5)
         if r.status_code == 200:
             df = pd.DataFrame(r.json(), columns=['time','open','high','low','close','vol','x','y','z','t','w','q'])
@@ -54,9 +53,11 @@ def veri_getir(symbol):
             df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
             df['wma30'] = calculate_wma(df['close'], 30)
             
-            # Swing Noktaları (Repaint olmayan)
-            df['swing_high'] = df['high'].shift(1).rolling(window=10).max()
-            df['swing_low'] = df['low'].shift(1).rolling(window=10).min()
+            # SWING NOKTALARI (LİKİDİTE BÖLGELERİ)
+            # Son 15 mumun en yükseği ve en düşüğü
+            # ffill() kullanıyoruz ki son swing değerini hafızada tutsun (Çizgi gibi uzatsın)
+            df['swing_high'] = df['high'].shift(1).rolling(window=15).max().ffill()
+            df['swing_low'] = df['low'].shift(1).rolling(window=15).min().ffill()
             
             return df
     except: return None
@@ -66,17 +67,14 @@ def tekil_analiz(symbol, aktif_islemler):
     df = veri_getir(symbol)
     if df is None: return "VERI_YOK"
     
-    curr = df.iloc[-2]
-    live = df.iloc[-1]
+    curr = df.iloc[-2] # Kapanmış mum
+    live = df.iloc[-1] # Canlı mum
     anlik_fiyat = live['close']
-    
-    last_swing_high = curr['swing_high']
-    last_swing_low = curr['swing_low']
     
     # Tolerans (%0.25)
     tolerans = curr['close'] * 0.0025 
 
-    # 1. AÇIK İŞLEM KONTROLÜ
+    # 1. AÇIK İŞLEM KONTROLÜ (Aynı mantık)
     if symbol in aktif_islemler:
         islem = aktif_islemler[symbol]
         yon = islem['yon']
@@ -84,52 +82,75 @@ def tekil_analiz(symbol, aktif_islemler):
         sl = islem['sl']
         giris = islem['giris']
         
-        # Long Kontrol
+        kar_yuzdesi = round(((anlik_fiyat - giris) / giris) * 100, 2)
+        if yon == "SHORT": kar_yuzdesi *= -1
+
         if yon == "LONG":
             if anlik_fiyat >= tp:
-                kar = round(((tp - giris) / giris) * 100, 2)
-                telegrama_gonder(f"✅ {symbol} LONG BAŞARILI! (TP)\n💰 Kar: %{kar}")
+                telegrama_gonder(f"✅ {symbol} LONG TP (LİKİDİTE ALINDI)!\n💰 Kar: %{kar_yuzdesi}\n🎯 Hedef: {tp}")
                 del aktif_islemler[symbol]
                 return "TP_OLDU"
             elif anlik_fiyat <= sl:
-                telegrama_gonder(f"❌ {symbol} LONG STOP OLDU (SL)\n🔻 Fiyat: {sl}")
+                telegrama_gonder(f"❌ {symbol} LONG STOP (YAPI BOZULDU)!\n📉 Zarar: %{kar_yuzdesi}\n🛑 Stop: {sl}")
                 del aktif_islemler[symbol]
                 return "SL_OLDU"
 
-        # Short Kontrol
         elif yon == "SHORT":
             if anlik_fiyat <= tp:
-                kar = round(((giris - tp) / giris) * 100, 2)
-                telegrama_gonder(f"✅ {symbol} SHORT BAŞARILI! (TP)\n💰 Kar: %{kar}")
+                telegrama_gonder(f"✅ {symbol} SHORT TP (LİKİDİTE ALINDI)!\n💰 Kar: %{kar_yuzdesi}\n🎯 Hedef: {tp}")
                 del aktif_islemler[symbol]
                 return "TP_OLDU"
             elif anlik_fiyat >= sl:
-                telegrama_gonder(f"❌ {symbol} SHORT STOP OLDU (SL)\n🔻 Fiyat: {sl}")
+                telegrama_gonder(f"❌ {symbol} SHORT STOP (YAPI BOZULDU)!\n📉 Zarar: %{kar_yuzdesi}\n🛑 Stop: {sl}")
                 del aktif_islemler[symbol]
                 return "SL_OLDU"
         
         return "ISLEM_ACIK"
 
-    # 2. YENİ SİNYAL ARAMA
-    if curr['ema9'] > curr['wma30']: # Long Trend
-        if curr['close'] > last_swing_high:
-            if curr['low'] <= (curr['ema9'] + tolerans):
-                sl = round(curr['wma30'] * 0.995, 2)
-                tp = round(curr['close'] + ((curr['close'] - sl) * 2), 2)
-                
-                aktif_islemler[symbol] = {"yon": "LONG", "giris": curr['close'], "tp": tp, "sl": sl}
-                telegrama_gonder(f"🚀 {symbol} LONG FIRSATI!\n🛑 SL: {sl}\n🎯 TP: {tp}")
-                return "YENI_LONG"
+    # 2. YENİ SİNYAL ARAMA (MARKET STRUCTURE)
+    
+    # Swing Noktalarını Al
+    last_support = curr['swing_low']  # Son Dip (Destek)
+    last_resistance = curr['swing_high'] # Son Tepe (Direnç)
+    
+    giris_fiyati = curr['close']
 
-    elif curr['ema9'] < curr['wma30']: # Short Trend
-        if curr['close'] < last_swing_low:
-            if curr['high'] >= (curr['ema9'] - tolerans):
-                sl = round(curr['wma30'] * 1.005, 2)
-                tp = round(curr['close'] - ((sl - curr['close']) * 2), 2)
+    # LONG SENARYOSU
+    if curr['ema9'] > curr['wma30']: 
+        # Fiyat EMA'ya değdi mi? (Pullback)
+        if curr['low'] <= (curr['ema9'] + tolerans):
+            # SL: Son Swing Low (Yapı bozulursa çık)
+            sl = last_support
+            # TP: Son Swing High (Likiditeye git)
+            tp = last_resistance
+            
+            # Filtre: Eğer Hedef Fiyattan düşükse girme (Saçma olur)
+            if tp > giris_fiyati and sl < giris_fiyati:
+                # RR Kontrolü: En azından 1:1 veya üstü veriyor mu?
+                potential_risk = giris_fiyati - sl
+                potential_reward = tp - giris_fiyati
                 
-                aktif_islemler[symbol] = {"yon": "SHORT", "giris": curr['close'], "tp": tp, "sl": sl}
-                telegrama_gonder(f"🔻 {symbol} SHORT FIRSATI!\n🛑 SL: {sl}\n🎯 TP: {tp}")
-                return "YENI_SHORT"
+                if potential_reward >= potential_risk * 1.0: # En az 1:1 RR (Scalp için uygun)
+                    aktif_islemler[symbol] = {"yon": "LONG", "giris": giris_fiyati, "tp": tp, "sl": sl}
+                    telegrama_gonder(f"🚀 {symbol} LONG (SCALP)!\n\n🎯 Hedef (Likidite): {tp}\n🛑 Stop (Swing Low): {sl}\n💵 Giriş: {giris_fiyati}")
+                    return "YENI_LONG"
+
+    # SHORT SENARYOSU
+    elif curr['ema9'] < curr['wma30']: 
+        if curr['high'] >= (curr['ema9'] - tolerans):
+            # SL: Son Swing High
+            sl = last_resistance
+            # TP: Son Swing Low
+            tp = last_support
+            
+            if tp < giris_fiyati and sl > giris_fiyati:
+                potential_risk = sl - giris_fiyati
+                potential_reward = giris_fiyati - tp
+                
+                if potential_reward >= potential_risk * 1.0:
+                    aktif_islemler[symbol] = {"yon": "SHORT", "giris": giris_fiyati, "tp": tp, "sl": sl}
+                    telegrama_gonder(f"🔻 {symbol} SHORT (SCALP)!\n\n🎯 Hedef (Likidite): {tp}\n🛑 Stop (Swing High): {sl}\n💵 Giriş: {giris_fiyati}")
+                    return "YENI_SHORT"
 
     return "NÖTR"
 
@@ -144,18 +165,13 @@ def ana_motor():
 
 # --- ENDPOINTLER ---
 @app.get("/")
-def home(): return {"mesaj": "Bot Calisiyor"}
+def home(): return {"mesaj": "Market Structure Bot Aktif"}
 
 @app.get("/analiz-yap")
-def flutter():
-    return {"zaman": datetime.now().strftime("%H:%M:%S"), "analizler": ana_motor()}
+def flutter(): return {"zaman": datetime.now().strftime("%H:%M:%S"), "analizler": ana_motor()}
 
 @app.get("/tetikle")
-def cron():
-    ana_motor()
-    return {"durum": "OK"}
+def cron(): ana_motor(); return {"durum": "OK"}
 
 @app.get("/test")
-def test():
-    telegrama_gonder("🔔 TEST: Bağlantı Başarılı!")
-    return {"durum": "Mesaj gönderildi"}
+def test(): telegrama_gonder("🔔 TEST: Bağlantı Başarılı!"); return {"durum": "Mesaj gönderildi"}
