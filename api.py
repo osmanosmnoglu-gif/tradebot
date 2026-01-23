@@ -42,7 +42,10 @@ def calculate_wma(series, period):
 
 def veri_getir(symbol):
     try:
-        url = "https://api.binance.com/api/v3/klines"
+        # --- DÜZELTME BURADA ---
+        # Spot (api.binance) yerine Futures (fapi.binance) kullanıyoruz
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        
         # 300 mum çekiyoruz ki gerideki swingleri net bulabilelim
         params = {"symbol": symbol, "interval": "15m", "limit": 300}
         r = requests.get(url, params=params, timeout=5)
@@ -54,8 +57,6 @@ def veri_getir(symbol):
             df['wma30'] = calculate_wma(df['close'], 30)
             
             # SWING NOKTALARI (LİKİDİTE BÖLGELERİ)
-            # Son 15 mumun en yükseği ve en düşüğü
-            # ffill() kullanıyoruz ki son swing değerini hafızada tutsun (Çizgi gibi uzatsın)
             df['swing_high'] = df['high'].shift(1).rolling(window=15).max().ffill()
             df['swing_low'] = df['low'].shift(1).rolling(window=15).min().ffill()
             
