@@ -52,10 +52,7 @@ if os.path.exists(MODEL_DOSYASI):
         bst = xgb.Booster()
         bst.load_model(MODEL_DOSYASI)
         model_durumu = "AKTİF 🟢"
-    except:
-        model_durumu = "HATA 🔴"
-else:
-    model_durumu = "DOSYA YOK ⚪️"
+    except: model_durumu = "HATA 🔴"
 
 def yapay_zeka_onayi(df):
     if bst is None: return True, 0.0
@@ -70,23 +67,29 @@ def yapay_zeka_onayi(df):
         dmatrix = xgb.DMatrix(data, feature_names=['rsi', 'adx', 'atr', 'ema_dist'])
         olasilik = bst.predict(dmatrix)[0]
         
-        # EŞİK DEĞERİ DÜŞÜRÜLDÜ: 0.65 -> 0.50 (Daha fazla işlem için)
-        if olasilik > 0.50: return True, float(olasilik)
+        if olasilik > 0.50: return True, float(olasilik) # Güven eşiği %50
         else: return False, float(olasilik)
     except: return True, 0.0
 
 def veri_getir(symbol):
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
+        # Daha fazla mum çekiyoruz ki geçmişi unutmasın
         params = {"symbol": symbol, "interval": "15m", "limit": 500}
         r = requests.get(url, params=params, timeout=5)
         if r.status_code == 200:
             df = pd.DataFrame(r.json(), columns=['time','open','high','low','close','vol','x','y','z','t','w','q'])
             df = df.astype({'open':'float','high':'float','low':'float','close':'float'})
+            
             df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
             df['wma30'] = calculate_wma(df['close'], 30)
-            df['swing_high'] = df['high'].shift(1).rolling(window=10).max()
-            df['swing_low'] = df['low'].shift(1).rolling(window=10).min()
+            
+            # --- DÜZELTME 1: Swing Noktalarını Daha Belirgin Yap ---
+            # window=20: Son 5 saat içindeki en büyük tepeyi "Ana Tepe" kabul et.
+            # Böylece küçük zikzakları tepe sanmaz.
+            df['swing_high'] = df['high'].shift(1).rolling(window=20).max()
+            df['swing_low'] = df['low'].shift(1).rolling(window=20).min()
+            
             return df
     except: return None
 
@@ -99,7 +102,6 @@ def tekil_analiz(symbol, aktif_islemler, debug_mode=False):
     live = df.iloc[-1]
     anlik_fiyat = live['close']
     
-    # Debug bilgileri
     debug_info = {
         "fiyat": anlik_fiyat,
         "trend": "NÖTR",
@@ -120,75 +122,78 @@ def tekil_analiz(symbol, aktif_islemler, debug_mode=False):
         if yon == "SHORT": kar *= -1
 
         if (yon == "LONG" and anlik_fiyat >= tp) or (yon == "SHORT" and anlik_fiyat <= tp):
-            telegrama_gonder(f"✅ {symbol} TP!\n💰 Kar: %{kar}")
+            telegrama_gonder(f"✅ {symbol} TP ALDI!\n💰 Kar: %{kar}\nSetup: MSB + AI")
             del aktif_islemler[symbol]
             return "TP_OLDU"
         elif (yon == "LONG" and anlik_fiyat <= sl) or (yon == "SHORT" and anlik_fiyat >= sl):
-            telegrama_gonder(f"❌ {symbol} STOP!\n📉 Zarar: %{kar}")
+            telegrama_gonder(f"❌ {symbol} STOP OLDU.\n📉 Zarar: %{kar}")
             del aktif_islemler[symbol]
             return "SL_OLDU"
         
-        if debug_mode: return {"durum": "ISLEM_ACIK", "detay": f"{yon} İşlemi Devam Ediyor. Kar: %{kar}"}
+        if debug_mode: return {"durum": "ISLEM_ACIK", "detay": f"{yon} Devam Ediyor. Kar: %{kar}"}
         return "ISLEM_ACIK"
 
     # 2. YENİ SİNYAL TARAMA
-    last_swing_high = df['swing_high'].iloc[-5:].max()
-    last_swing_low = df['swing_low'].iloc[-5:].min()
+    # Son 30 mumun (7.5 Saat) en yüksek tepesi
+    last_swing_high = df['swing_high'].iloc[-30:].max()
+    last_swing_low = df['swing_low'].iloc[-30:].min()
     
-    # AI ANALİZİ
     onay, skor = yapay_zeka_onayi(df)
     debug_info["ai_skor"] = round(skor, 2)
     
     # LONG SETUP
     if curr['ema9'] > curr['wma30']: 
         debug_info["trend"] = "BULLISH"
-        msb = (df['close'].iloc[-10:-1] > last_swing_high).any()
+        
+        # --- DÜZELTME 2: Hafızayı Uzat (30 Mum) ---
+        # Son 30 mum içinde (7.5 saat) herhangi biri Swing High'ın üstünde KAPATTI MI?
+        msb = (df['close'].iloc[-30:-1] > last_swing_high).any()
+        
         if msb:
-            debug_info["msb"] = "VAR (Long)"
-            giris_ust = last_swing_high * 1.003
-            giris_alt = last_swing_high * 0.995
+            debug_info["msb"] = "VAR (Long - Son 7.5 Saat)"
             
-            # Fiyat bölgede mi?
+            # Retest Bölgesi (Biraz daha geniş tolerans)
+            giris_ust = last_swing_high * 1.004 # %0.4 üstü
+            giris_alt = last_swing_high * 0.995 # %0.5 altı
+            
             if giris_alt <= anlik_fiyat <= giris_ust:
-                if not onay:
-                    debug_info["sebep"] = "AI Reddediyor"
+                if not onay: debug_info["sebep"] = "AI Reddediyor"
                 else:
                     sl = last_swing_low
                     tp = anlik_fiyat + ((anlik_fiyat - sl) * 2.0)
                     if sl < anlik_fiyat:
                         if not debug_mode:
                             aktif_islemler[symbol] = {"yon": "LONG", "giris": anlik_fiyat, "tp": tp, "sl": sl}
-                            telegrama_gonder(f"🚀 {symbol} LONG!\n🤖 AI: {round(skor,2)}\n🎯 TP: {tp}")
+                            telegrama_gonder(f"🚀 {symbol} LONG!\n\n📌 MSB Onaylandı\n🤖 AI: {round(skor,2)}\n🎯 TP: {tp}")
                         return "YENI_LONG"
-            else:
-                debug_info["sebep"] = "Retest Bölgesinde Değil"
-        else:
-            debug_info["sebep"] = "MSB (Kırılım) Yok"
+            else: debug_info["sebep"] = f"Retest Bekleniyor (Hedef: {round(last_swing_high, 2)})"
+        else: debug_info["sebep"] = "MSB (Kırılım) Yok"
 
     # SHORT SETUP
     elif curr['ema9'] < curr['wma30']:
         debug_info["trend"] = "BEARISH"
-        msb = (df['close'].iloc[-10:-1] < last_swing_low).any()
+        
+        # Son 30 mum içinde dibin altında kapatan mum var mı?
+        msb = (df['close'].iloc[-30:-1] < last_swing_low).any()
+        
         if msb:
-            debug_info["msb"] = "VAR (Short)"
+            debug_info["msb"] = "VAR (Short - Son 7.5 Saat)"
+            
             giris_ust = last_swing_low * 1.005
-            giris_alt = last_swing_low * 0.997
+            giris_alt = last_swing_low * 0.996
             
             if giris_alt <= anlik_fiyat <= giris_ust:
-                if not onay:
-                    debug_info["sebep"] = "AI Reddediyor"
+                if not onay: debug_info["sebep"] = "AI Reddediyor"
                 else:
                     sl = last_swing_high
                     tp = anlik_fiyat - ((sl - anlik_fiyat) * 2.0)
                     if sl > anlik_fiyat:
                         if not debug_mode:
                             aktif_islemler[symbol] = {"yon": "SHORT", "giris": anlik_fiyat, "tp": tp, "sl": sl}
-                            telegrama_gonder(f"🔻 {symbol} SHORT!\n🤖 AI: {round(skor,2)}\n🎯 TP: {tp}")
+                            telegrama_gonder(f"🔻 {symbol} SHORT!\n\n📌 MSB Onaylandı\n🤖 AI: {round(skor,2)}\n🎯 TP: {tp}")
                         return "YENI_SHORT"
-            else:
-                debug_info["sebep"] = "Retest Bölgesinde Değil"
-        else:
-            debug_info["sebep"] = "MSB (Kırılım) Yok"
+            else: debug_info["sebep"] = f"Retest Bekleniyor (Hedef: {round(last_swing_low, 2)})"
+        else: debug_info["sebep"] = "MSB (Kırılım) Yok"
 
     if debug_mode: return debug_info
     return "NÖTR"
@@ -204,23 +209,14 @@ def ana_motor():
 
 # --- ENDPOINTLER ---
 @app.get("/")
-def home(): return {"mesaj": "Bot Aktif", "model": model_durumu}
-
+def home(): return {"mesaj": "Geniş Hafızalı Bot Aktif", "model": model_durumu}
 @app.get("/tetikle")
 def cron(): ana_motor(); return {"durum": "OK"}
-
-# YENİ ÖZELLİK: BOTUN İÇİNİ GÖRMEK İÇİN
 @app.get("/durum")
 def sistem_durumu():
     aktif_islemler = islemleri_yukle()
     rapor = {}
-    for coin in COIN_LISTESI:
-        rapor[coin] = tekil_analiz(coin, aktif_islemler, debug_mode=True)
-    return {
-        "zaman": datetime.now().strftime("%H:%M:%S"),
-        "model_durumu": model_durumu,
-        "analiz": rapor
-    }
-
+    for coin in COIN_LISTESI: rapor[coin] = tekil_analiz(coin, aktif_islemler, debug_mode=True)
+    return {"zaman": datetime.now().strftime("%H:%M:%S"), "analiz": rapor}
 @app.get("/test")
 def test(): telegrama_gonder("🔔 TEST OK"); return {"durum": "OK"}
